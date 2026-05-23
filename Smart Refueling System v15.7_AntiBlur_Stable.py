@@ -3,6 +3,7 @@ import cv2
 import re
 import time
 import json
+import queue
 import gspread
 import threading
 import datetime
@@ -11,8 +12,6 @@ import pytesseract
 import urllib.parse
 from PIL import Image, ImageDraw, ImageFont
 from oauth2client.service_account import ServiceAccountCredentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
@@ -22,16 +21,12 @@ os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
 # =========================================================
 CREDS_FILE       = "service_account.json"
 SHEET_KEY        = "1AMVQ650o1dsiGbdp2W2NoUp7nhc-J8k33nc4Fd0uUes"
-DRIVE_FOLDER_ID = "1x3bEJHgQXhQCITnIuw6NHpTuEbp7MRxi"
-SAVE_DIR        = "saved_images"
-ROI_FILE        = "roi_config.json"
+ROI_FILE         = "roi_config.json"
 
 # 🚀 ปรับตั้งค่าความเสถียร (หน่วงเพื่อเช็กให้แน่ใจว่าตัวเลขนิ่งจริง ไม่ใช่รถวิ่งผ่าน)
 FUEL_STABLE_SEC = 5.0    
 SAVE_COOLDOWN   = 30.0   # ขยายเวลาคูลดาวน์เพื่อแก้ปัญหา Google API 403
 CELL_W, CELL_H  = 640, 360
-
-os.makedirs(SAVE_DIR, exist_ok=True)
 
 print("[ONNX] กำลังโหลดโมเดลอัจฉริยะ เข้าสู่ OpenCV DNN...")
 net = cv2.dnn.readNetFromONNX("best.onnx")
@@ -54,7 +49,11 @@ DEFAULT_ROI = {
     "TAPO2": [0.55, 0.65, 0.80, 0.85],
 }
 
-SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+# ใช้แค่สิทธิ์ Sheets ไม่พึ่งพา Google Drive อีกต่อไป
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/spreadsheets"]
+
+# ระบบคิวเพื่อจัดการการส่งข้อมูลขึ้น Google Sheets ป้องกัน exit code -11
+sheets_logging_queue = queue.Queue()
 
 # =========================================================
 # STATE
@@ -173,7 +172,6 @@ def setup_roi():
         cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         ret,fr = cap.read(); cap.release()
         
-        # 📍 [FIXED] เช็กกรณีสัญญาณกล้องหลุดช่วงเปิดปรับพิกัด ไม่ให้โปรแกรมดึงอาเรย์ว่างมาทำงานต่อ
         if not ret or fr is None:
             print(f"[WARNING] กล้อง {cam} ตัดการเชื่อมต่อชั่วคราว ไม่สามารถดึงภาพมาเซ็ตพิกัดขอบเขตได้")
             continue
@@ -203,8 +201,7 @@ def init_google():
     creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE,SCOPE)
     gc    = gspread.authorize(creds)
     sh    = gc.open_by_key(SHEET_KEY).sheet1
-    drv   = build("drive","v3",credentials=creds)
-    return sh, drv
+    return sh
 
 def rtsp_url(cam):
     c=CAM_CONFIG[cam]
@@ -229,7 +226,6 @@ def preprocess_ocr(img, mode):
     resized = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
     
     if mode == "fuel":
-        # 🚀 เปลี่ยนมาใช้โมดูลทวิภาคเข้มข้น ลบเงาเบลอวูบวาบจากการเคลื่อนไหวของรถ
         blur = cv2.bilateralFilter(resized, 9, 75, 75)
         _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     else:
@@ -317,59 +313,45 @@ def process_onnx_ocr(cam_key, frame, rx, mode):
         return "", frame
 
 # =========================================================
-# DRIVE UPLOAD
+# THREAD-SAFE QUEUE CLOUD LOGGING
 # =========================================================
-def upload_drive(drv, img_arr, prefix):
-    if img_arr is None or img_arr.size==0: return "no_image"
-    ts=datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    fn=f"{prefix}_{ts}.jpg"
-    path=os.path.join(SAVE_DIR,fn)
-    cv2.imwrite(path, img_arr, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-    
-    try:
-        meta={"name": fn, "parents": [DRIVE_FOLDER_ID]}
-        med=MediaFileUpload(path, mimetype="image/jpeg", resumable=False)
-        f=drv.files().create(body=meta, media_body=med, fields="id,webViewLink", supportsAllDrives=True).execute()
-        drv.permissions().create(fileId=f["id"], body={"type":"anyone","role":"reader"}, supportsAllDrives=True).execute()
-        return f.get("webViewLink","")
-    except Exception:
-        return "ERR_DRIVE_QUOTA"
+def google_sheets_worker_thread(sh):
+    """ คอยตรวจสอบและโยนข้อมูลลง Google Sheets จากคิวอย่างปลอดภัย ป้องกันโปรแกรมเด้ง """
+    while True:
+        row_data = sheets_logging_queue.get()
+        if row_data is None: break
+        
+        try:
+            sh.append_row(row_data)
+            print(f"   [SUCCESS] บันทึกข้อมูลคลาวด์ลง Sheets สำเร็จ!: {row_data}")
+        except Exception as e:
+            print(f"   [API DELAY WARNING] สิทธิ์ส่งถี่เกินขีดจำกัดคลาวด์ชั่วคราว: {e}")
+            
+        sheets_logging_queue.task_done()
+        time.sleep(1) # ป้องกันการยิง Request ถี่เกินไป
 
-# =========================================================
-# THREAD-SAFE COOLDOWN CLOUD LOGGING
-# =========================================================
-def log_to_sheet(sh, drv, station):
+def log_to_queue(station):
+    """ เตรียมชุดข้อมูล (Text ล้วนๆ ไม่มีรูปภาพ) แล้วส่งเข้า Queue """
     pcam = "CAM1"  if station=="S1" else "CAM2"
     fcam = "TAPO1" if station=="S1" else "TAPO2"
 
     pt  = plate_state[pcam]["text"]
-    with frame_locks[pcam]:
-        pi = latest_frames[pcam].copy() if latest_frames[pcam] is not None else None
-        
     ft  = fuel_state[fcam]["saved"]
-    with frame_locks[fcam]:
-        fi = latest_frames[fcam].copy() if latest_frames[fcam] is not None else None
 
-    print(f"\n[CLOUD LOGGING] กำลังบันทึกธุรกรรมของตู้จ่าย {station}...")
-
-    lp = upload_drive(drv, pi, f"plate_{station}")
-    lf = upload_drive(drv, fi, f"fuel_{station}")
+    print(f"\n[CLOUD LOGGING] เตรียมส่งข้อมูลธุรกรรมตู้จ่าย {station} เข้าคิว...")
 
     ts  = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    row = [ts,"","","","","","","",""]
+    # โครงสร้างคอลัมน์: Date, Plate_CAM1, Plate_CAM2, Fuel_CAM1, Fuel_CAM2
+    row = [ts, "", "", "", ""]
 
     if station=="S1":
-        row[1], row[3], row[5], row[7] = pt or "ไม่พบป้าย", ft or "0.00", lp, lf
+        row[1] = pt if pt else "ไม่พบป้าย"
+        row[3] = ft if ft else "0.00"
     else:
-        row[2], row[4], row[6], row[8] = pt or "ไม่พบป้าย", ft or "0.00", lp, lf
+        row[2] = pt if pt else "ไม่พบป้าย"
+        row[4] = ft if ft else "0.00"
 
-    try:
-        # บังคับหน่วงเสี้ยววินาทีป้องกันการแย่งสิทธิ์เขียนไฟล์แผ่นชีทพร้อมกัน
-        time.sleep(0.5) 
-        sh.append_row(row)
-        print(f"   [SUCCESS] บันทึกข้อมูลคลาวด์ {station} สำเร็จสิ้น!")
-    except Exception as e:
-        print(f"   [API DELAY WARNING] สิทธิ์ส่งถี่เกินขีดจำกัดคลาวด์ชั่วคราว: {e}")
+    sheets_logging_queue.put(row)
 
     # คืนค่าสิทธิ์ล็อกเกอร์เพื่อให้รับรถคันใหม่ได้หลังจากเสร็จงาน
     fuel_state[fcam]["lock_trigger"] = False
@@ -378,7 +360,7 @@ def log_to_sheet(sh, drv, station):
 # =========================================================
 # CORE CAMERA STREAM ENGINE
 # =========================================================
-def cam_thread(cam, sh, drv):
+def cam_thread(cam):
     mode  = CAM_CONFIG[cam]["mode"]
     label = CAM_CONFIG[cam]["label"]
 
@@ -425,7 +407,8 @@ def cam_thread(cam, sh, drv):
                                 fs["lock_trigger"] = True # ล็อกการทำงานชั่วคราวห้ามสั่งเบิ้ลบันทึก
                                 
                                 sid = "S1" if cam == "TAPO1" else "S2"
-                                threading.Thread(target=log_to_sheet, args=(sh,drv,sid), daemon=True).start()
+                                # ✅ เรียกใช้งานระบบ Queue แทนการต่อ API ตรง
+                                log_to_queue(sid)
 
             if disp is not None:
                 ov = disp.copy()
@@ -463,12 +446,15 @@ def main():
     ans = input("ต้องการปรับแต่งกรอบพิกัดสแกนหน้าตู้ใหม่หรือไม่? (y/n): ").strip().lower()
     if ans == "y": setup_roi()
 
-    sh, drv = init_google()
+    sh = init_google()
+    
+    # สตาร์ท Worker ของระบบ Queue ทันที
+    threading.Thread(target=google_sheets_worker_thread, args=(sh,), daemon=True).start()
 
     for k in CAM_CONFIG:
-        threading.Thread(target=cam_thread, args=(k,sh,drv), daemon=True).start()
+        threading.Thread(target=cam_thread, args=(k,), daemon=True).start()
 
-    print("\n[*] บูทระบบตัวกรองป้องกันภาพเคลื่อนไหวเละ แสตนด์บายทำงานเรียบร้อย...")
+    print("\n[*] บูทระบบตัวกรองป้องกันภาพเคลื่อนไหว และระงับ Drive API เรียบร้อยแล้ว...")
 
     while True:
         cells = []
@@ -512,6 +498,7 @@ def main():
         if k2 == ord('q'): break
 
     cv2.destroyAllWindows()
+    sheets_logging_queue.put(None) # แจ้งคิวให้หยุดรออย่างปลอดภัย
     print("[*] ปิดระบบเสร็จสิ้น")
 
 if __name__ == "__main__":
