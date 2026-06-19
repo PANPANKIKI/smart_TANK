@@ -48,7 +48,7 @@ PLATE_MIN_CONF = 0.003
 FUEL_MIN_CONF  = 0.003
 
 # เงื่อนไขทะเบียน
-PLATE_MIN_CHARS = 6       # OCR ต้องได้ ≥ 6 ตัวจึงบันทึก
+PLATE_MIN_CHARS = 5       # สำรองไว้ใช้อ้างอิง — เกณฑ์จริงใช้ looks_like_plate() (5-7 หลัก, pattern XX-XXXX)
 SAVE_COOLDOWN   = 12.0    # วินาที ป้องกันบันทึกซ้ำ
 
 # เงื่อนไขมิเตอร์
@@ -320,8 +320,11 @@ def normalize_text(text, mode="plate"):
         return ""
     text = text.upper().strip()
     if mode == "plate":
-        text = re.sub(r"[^A-Z0-9ก-ฮ]", "", text)
-        text = text.replace("O", "0").replace("I", "1").replace("Z", "2").replace("S", "5")
+        # ทะเบียนของระบบนี้เป็นตัวเลขล้วน รูปแบบ XX-XXXX ไม่มีตัวอักษรไทย/อังกฤษ
+        text = text.replace("|", "1").replace("/", "1").replace("\\", "1")
+        text = text.replace("O", "0").replace("I", "1").replace("Z", "2")
+        text = text.replace("S", "5").replace("B", "8")
+        text = re.sub(r"[^0-9\-]", "", text)
         return text
     text = text.replace("|", "1").replace("/", "1").replace("\\", "1").replace("O", "0")
     text = re.sub(r"[^0-9.]", "", text)
@@ -329,6 +332,18 @@ def normalize_text(text, mode="plate"):
         parts = text.split(".")
         text  = parts[0] + "." + "".join(parts[1:])
     return text
+
+# ============================================================
+#  ตรวจสอบว่าข้อความหน้าตาเหมือนทะเบียน XX-XXXX หรือไม่
+# ============================================================
+def looks_like_plate(text):
+    """
+    ทะเบียนรูปแบบจริงของระบบนี้: เลข 2 หลัก - เลข 4 หลัก เช่น 74-5710
+    คืน True ถ้า digits-only ของ text มีความยาว 5-7 หลัก
+    (กันกรณี OCR อ่านขาด/เกินมาเล็กน้อย)
+    """
+    digits = re.sub(r"[^0-9]", "", text)
+    return 5 <= len(digits) <= 7
 
 # ============================================================
 #  preprocess OCR ทะเบียน — เพิ่ม upscale สำหรับป้ายไกล
@@ -390,8 +405,9 @@ def preprocess_ocr_fuel(img):
 def ocr_plate(img):
     """
     รับ crop จาก YOLO → หาบริเวณสีเหลือง → ตัดแถบ THAILAND → OCR
-    คืน string ที่ดีที่สุด (อาจสั้นกว่า PLATE_MIN_CHARS ก็ได้)
-    caller ตัดสินใจว่าจะบันทึกหรือไม่
+    ทะเบียนของระบบนี้เป็นตัวเลขล้วน (XX-XXXX) จึงจำกัด whitelist เฉพาะตัวเลข
+    และเลือกผลลัพธ์ที่ "ตรง pattern ทะเบียน" ไม่ใช่ผลลัพธ์ที่ "ยาวที่สุด"
+    เพื่อกัน OCR อ่านมั่วเอาเส้น/ขอบ/ตัวอักษรจางๆ มาปนเป็นสตริงยาว
     """
     if img is None:
         return ""
@@ -425,25 +441,34 @@ def ocr_plate(img):
     if th is None:
         return ""
 
-    whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ก-ฮ"
+    # whitelist เฉพาะตัวเลข + ขีด — ทะเบียนระบบนี้ไม่มีตัวอักษรเลย
+    whitelist = "0123456789-"
     configs = [
-        f"--psm 7 --oem 3 -c tessedit_char_whitelist={whitelist}",
-        f"--psm 8 --oem 3 -c tessedit_char_whitelist={whitelist}",
+        f"--psm 7  --oem 3 -c tessedit_char_whitelist={whitelist}",
+        f"--psm 8  --oem 3 -c tessedit_char_whitelist={whitelist}",
         f"--psm 13 --oem 3 -c tessedit_char_whitelist={whitelist}",
-        f"--psm 6 --oem 3 -c tessedit_char_whitelist={whitelist}",
     ]
 
-    best = ""
+    candidates = []
     for cfg in configs:
-        raw    = pytesseract.image_to_string(th, lang="tha+eng", config=cfg)
+        raw    = pytesseract.image_to_string(th, lang="eng", config=cfg)
         result = normalize_text(raw, "plate")
         dprint(f"[OCR-PLATE] {cfg.split()[1]} raw='{raw.strip()}' -> '{result}'")
-        if len(result) > len(best):
-            best = result
-        if len(best) >= PLATE_MIN_CHARS:
-            break   # ได้แล้ว ไม่ต้องลอง config ถัดไป
+        if result:
+            candidates.append(result)
 
-    return best
+    if not candidates:
+        return ""
+
+    # เลือกตัวที่ "ตรง pattern ทะเบียน" (5-7 หลัก) ก่อน
+    valid = [c for c in candidates if looks_like_plate(c)]
+    if valid:
+        # ในกลุ่มที่ valid เลือกตัวที่ยาวที่สุด (ครบถ้วนที่สุด)
+        return max(valid, key=len)
+
+    # ไม่มีตัวไหน valid เลย → คืนตัวที่ยาวที่สุดแบบเดิม (เผื่อ caller อยากดู)
+    # แต่ caller จะปฏิเสธอยู่ดีถ้าไม่ผ่าน PLATE_MIN_CHARS/looks_like_plate
+    return max(candidates, key=len)
 
 # ============================================================
 #  OCR มิเตอร์
@@ -824,19 +849,20 @@ def cam_thread_plate():
 
             # ── OCR ────────────────────────────────────────────────
             txt = ocr_plate(best_crop)
-            dprint(f"[CAM1] OCR='{txt}' len={len(txt)} conf={conf:.4f}")
+            digit_count = len(re.sub(r"[^0-9]", "", txt))
+            dprint(f"[CAM1] OCR='{txt}' digits={digit_count} conf={conf:.4f}")
 
-            # ── Decision: OCR ถูกต้องหรือไม่ ───────────────────────
-            if len(txt) < PLATE_MIN_CHARS:
+            # ── Decision: OCR ถูกต้องหรือไม่ (ต้องตรง pattern ทะเบียน XX-XXXX) ──
+            if not looks_like_plate(txt):
                 # อ่านไม่ถูกต้อง → แสดงผล loop ต่อ
-                label = (f"[CAM1] OCR: '{txt}' ({len(txt)} ตัว — ต้องการ ≥{PLATE_MIN_CHARS})"
+                label = (f"[CAM1] OCR: '{txt}' ({digit_count} หลัก — ไม่ตรงรูปแบบทะเบียน)"
                          if txt else f"[CAM1] OCR ไม่ได้ผล  [{conf:.3f}]")
                 disp  = put_text(disp, label, (8, 10), (0, 120, 255), 20)
                 with frame_locks[cam_key]:
                     latest_frames[cam_key] = disp.copy()
                 continue
 
-            # ── OCR ผ่าน ≥ PLATE_MIN_CHARS ──────────────────────────
+            # ── OCR ตรง pattern ทะเบียน ──────────────────────────────
             # เช็ค cooldown ป้องกันบันทึกซ้ำ
             with ss["lock"]:
                 since_last = time.time() - ss["last_save"]
