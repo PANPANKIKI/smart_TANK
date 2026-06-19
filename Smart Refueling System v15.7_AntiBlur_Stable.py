@@ -14,6 +14,7 @@ import gspread
 import gc
 from PIL import Image, ImageDraw, ImageFont
 from oauth2client.service_account import ServiceAccountCredentials
+
 # ============================================================
 #  Google Drive API
 # ============================================================
@@ -38,27 +39,23 @@ CREDS_FILE      = "service_account.json"
 SHEET_KEY       = "1AMVQ650o1dsiGbdp2W2NoUp7nhc-J8k33nc4Fd0uUes"
 DRIVE_FOLDER_ID = "1x3bEJHgQXhQCITnIuw6NHpTuEbp7MRxi"
 
-TYPHOON_API_KEY = ""
-TYPHOON_ENABLED = bool(TYPHOON_API_KEY)
-
 PLATE_MODEL = "bestLicensePlate.onnx"
 FUEL_MODEL  = "bestTANK.onnx"
 ROI_FILE    = "roi_config.json"
 
-# ค่าความมั่นใจขั้นต่ำ
-PLATE_MIN_CONF = 0.10
-FUEL_MIN_CONF   = 0.15
+# ค่าความมั่นใจขั้นต่ำ — ลดลงเพื่อจับรถจอดนิ่ง/ป้ายไกล
+PLATE_MIN_CONF = 0.003
+FUEL_MIN_CONF  = 0.003
 
 # เงื่อนไขทะเบียน
-PLATE_MIN_CHARS      = 5
-PLATE_CONFIRM_FRAMES = 2
-PLATE_CONFIRM_SEC    = 2.0
-SAVE_COOLDOWN        = 12.0
+PLATE_MIN_CHARS = 6       # OCR ต้องได้ ≥ 6 ตัวจึงบันทึก
+SAVE_COOLDOWN   = 12.0    # วินาที ป้องกันบันทึกซ้ำ
 
 # เงื่อนไขมิเตอร์
-OCR_WINDOW_SIZE = 15
-FUEL_MIN_VOTES  = 3
-FUEL_STABLE_SEC = 4.0
+OCR_WINDOW_SIZE  = 15
+FUEL_MIN_VOTES   = 3
+FUEL_STABLE_SEC  = 4.0
+FUEL_MIN_CHARS   = 4      # OCR มิเตอร์ต้องได้ ≥ 4 ตัวเลข
 
 # ขนาดหน้าจอแสดงผล
 CELL_W, CELL_H = 640, 360
@@ -128,19 +125,16 @@ def dprint(*args):
 # ============================================================
 def _new_station_state():
     return {
-        "state": STATE_WAIT_PLATE,
-        "plate_text": "",
-        "plate_img": None,
-        "fuel_last_text": "",
-        "fuel_img": None,
-        "fuel_since": 0.0,
+        "state":            STATE_WAIT_PLATE,
+        "plate_text":       "",
+        "plate_img":        None,
+        "fuel_last_text":   "",
+        "fuel_img":         None,
+        "fuel_since":       0.0,
         "fuel_raw_history": [],
-        "sheet_row_idx": None,
-        "last_save": 0.0,
-        "confirm_hits": 0,
-        "confirm_value": "",
-        "confirm_first_ts": 0.0,
-        "lock": threading.Lock(),
+        "sheet_row_idx":    None,
+        "last_save":        0.0,
+        "lock":             threading.Lock(),
     }
 
 station_state = {
@@ -171,12 +165,11 @@ def rtsp_url(cam):
     return f"rtsp://{c['user']}:{urllib.parse.quote_plus(c['pass'])}@{c['ip']}:554{c['path']}"
 
 # ============================================================
-#  โหลดฟอนต์สำหรับวาดข้อความ
+#  โหลดฟอนต์
 # ============================================================
 def get_font(size=20):
     if size in _font_cache:
         return _font_cache[size]
-
     for p in [
         "/home/agentfuel/cam_fuel/TAHOMA.TTF",
         "/home/agentfuel/cam_fuel/TAHOMA.ttf",
@@ -190,7 +183,6 @@ def get_font(size=20):
                 return f
             except Exception:
                 pass
-
     f = ImageFont.load_default()
     _font_cache[size] = f
     return f
@@ -207,15 +199,8 @@ def put_text(img, text, pos, color=(0, 220, 120), size=20):
         ImageDraw.Draw(pil).text(pos, str(text), font=get_font(size), fill=tuple(color))
         return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
     except Exception:
-        cv2.putText(
-            img,
-            str(text),
-            pos,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (int(color[2]), int(color[1]), int(color[0])),
-            2
-        )
+        cv2.putText(img, str(text), pos, cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (int(color[2]), int(color[1]), int(color[0])), 2)
         return img
 
 # ============================================================
@@ -225,10 +210,8 @@ def get_roi_crop(img, rx):
     if img is None:
         return None
     H, W = img.shape[:2]
-    x1 = int(rx[0] * W)
-    y1 = int(rx[1] * H)
-    x2 = int(rx[2] * W)
-    y2 = int(rx[3] * H)
+    x1 = int(rx[0] * W); y1 = int(rx[1] * H)
+    x2 = int(rx[2] * W); y2 = int(rx[3] * H)
     c = img[y1:y2, x1:x2]
     return c if c.size > 0 else None
 
@@ -239,7 +222,6 @@ def load_roi(reset=False):
     global roi_cfg
     if reset and os.path.exists(ROI_FILE):
         os.remove(ROI_FILE)
-
     if os.path.exists(ROI_FILE):
         try:
             with open(ROI_FILE, "r", encoding="utf-8") as f:
@@ -273,12 +255,12 @@ def get_net(model_path):
 # ============================================================
 class RealtimeCapture:
     def __init__(self, url, timeout_sec=8):
-        self._url = url
+        self._url         = url
         self._timeout_sec = timeout_sec
-        self._frame = None
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._frame       = None
+        self._lock        = threading.Lock()
+        self._stop        = threading.Event()
+        self._thread      = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
         self._thread.start()
@@ -341,22 +323,31 @@ def normalize_text(text, mode="plate"):
         text = re.sub(r"[^A-Z0-9ก-ฮ]", "", text)
         text = text.replace("O", "0").replace("I", "1").replace("Z", "2").replace("S", "5")
         return text
-
     text = text.replace("|", "1").replace("/", "1").replace("\\", "1").replace("O", "0")
     text = re.sub(r"[^0-9.]", "", text)
     if text.count(".") > 1:
         parts = text.split(".")
-        text = parts[0] + "." + "".join(parts[1:])
+        text  = parts[0] + "." + "".join(parts[1:])
     return text
 
 # ============================================================
-#  preprocess OCR ทะเบียน
+#  preprocess OCR ทะเบียน — เพิ่ม upscale สำหรับป้ายไกล
 # ============================================================
 def preprocess_ocr_plate(img):
     if img is None:
         return None
     h, w = img.shape[:2]
-    scale = 3.0 if min(h, w) < 120 else 2.0
+
+    # ถ้าภาพเล็กมาก (ป้ายไกล) ให้ upscale มากขึ้น
+    if min(h, w) < 40:
+        scale = 6.0
+    elif min(h, w) < 80:
+        scale = 4.0
+    elif min(h, w) < 120:
+        scale = 3.0
+    else:
+        scale = 2.0
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.fastNlMeansDenoising(gray, h=10)
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
@@ -364,12 +355,9 @@ def preprocess_ocr_plate(img):
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(6, 6))
     gray = clahe.apply(gray)
     gray = cv2.filter2D(gray, -1, np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]]))
-    th = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 11
-    )
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 31, 11)
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN,  np.ones((2, 2), np.uint8), iterations=1)
     th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8), iterations=1)
     return th
 
@@ -387,42 +375,83 @@ def preprocess_ocr_fuel(img):
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
-
-    th_adapt = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY, 31, 9
-    )
+    th_adapt = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                     cv2.THRESH_BINARY, 31, 9)
     _, th_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
     ratio_adapt = np.sum(th_adapt > 0) / th_adapt.size
-    ratio_otsu  = np.sum(th_otsu > 0) / th_otsu.size
+    ratio_otsu  = np.sum(th_otsu  > 0) / th_otsu.size
     th = th_adapt if abs(ratio_adapt - 0.5) < abs(ratio_otsu - 0.5) else th_otsu
-
     th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
     return th
 
 # ============================================================
-#  OCR ทะเบียน
+#  OCR ทะเบียน — คืนค่าดีสุดเสมอ
 # ============================================================
 def ocr_plate(img):
-    th = preprocess_ocr_plate(img)
+    """
+    รับ crop จาก YOLO → หาบริเวณสีเหลือง → ตัดแถบ THAILAND → OCR
+    คืน string ที่ดีที่สุด (อาจสั้นกว่า PLATE_MIN_CHARS ก็ได้)
+    caller ตัดสินใจว่าจะบันทึกหรือไม่
+    """
+    if img is None:
+        return ""
+
+    crop_for_ocr = img
+
+    # ── หาบริเวณป้ายสีเหลือง ──────────────────────────────
+    try:
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, np.array([10, 40, 60]), np.array([45, 255, 255]))
+        ys, xs = np.where(mask > 0)
+        if len(xs) > 50:
+            x1, x2 = xs.min(), xs.max()
+            y1, y2 = ys.min(), ys.max()
+            h_img, w_img = img.shape[:2]
+            pad_x = int((x2 - x1) * 0.05) + 3
+            pad_y = int((y2 - y1) * 0.15) + 3
+            x1 = max(0, x1 - pad_x); y1 = max(0, y1 - pad_y)
+            x2 = min(w_img, x2 + pad_x); y2 = min(h_img, y2 + pad_y)
+            if (x2 - x1) > 20 and (y2 - y1) > 10:
+                crop_for_ocr = img[y1:y2, x1:x2]
+    except Exception:
+        pass
+
+    # ── ตัดแถบ THAILAND ด้านบน ────────────────────────────
+    h, w = crop_for_ocr.shape[:2]
+    y_s = int(h * 0.32); y_e = int(h * 0.78)
+    top_crop = crop_for_ocr[y_s:y_e, :] if crop_for_ocr[y_s:y_e, :].size > 0 else crop_for_ocr
+
+    th = preprocess_ocr_plate(top_crop)
     if th is None:
         return ""
-    cfg = "--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ก-ฮ"
-    raw = pytesseract.image_to_string(th, lang="tha+eng", config=cfg)
-    result = normalize_text(raw, "plate")
-    dprint(f"[OCR-PLATE] raw='{raw.strip()}' -> '{result}'")
-    return result
+
+    whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ก-ฮ"
+    configs = [
+        f"--psm 7 --oem 3 -c tessedit_char_whitelist={whitelist}",
+        f"--psm 8 --oem 3 -c tessedit_char_whitelist={whitelist}",
+        f"--psm 13 --oem 3 -c tessedit_char_whitelist={whitelist}",
+        f"--psm 6 --oem 3 -c tessedit_char_whitelist={whitelist}",
+    ]
+
+    best = ""
+    for cfg in configs:
+        raw    = pytesseract.image_to_string(th, lang="tha+eng", config=cfg)
+        result = normalize_text(raw, "plate")
+        dprint(f"[OCR-PLATE] {cfg.split()[1]} raw='{raw.strip()}' -> '{result}'")
+        if len(result) > len(best):
+            best = result
+        if len(best) >= PLATE_MIN_CHARS:
+            break   # ได้แล้ว ไม่ต้องลอง config ถัดไป
+
+    return best
 
 # ============================================================
-#  OCR มิเตอร์: หา candidate หลายแบบ
+#  OCR มิเตอร์
 # ============================================================
 def ocr_fuel_candidates(img):
     th = preprocess_ocr_fuel(img)
     if th is None:
         return []
-
     out = []
     configs = [
         "--psm 7  --oem 3 -c tessedit_char_whitelist=0123456789.",
@@ -436,9 +465,6 @@ def ocr_fuel_candidates(img):
             out.append(txt)
     return out
 
-# ============================================================
-#  OCR มิเตอร์: เลือกค่าที่ซ้ำมากสุด
-# ============================================================
 def ocr_fuel(img):
     cands = ocr_fuel_candidates(img)
     if not cands:
@@ -449,58 +475,63 @@ def ocr_fuel(img):
     return max(counts, key=counts.get)
 
 # ============================================================
-#  แปลงผล YOLO ออกมาเป็น bounding box
+#  YOLO postprocess
 # ============================================================
-def yolo_postprocess(frame, raw, conf_thres=0.25, nms_thres=0.45):
-    BLOB_SIZE = 640
-    h, w = frame.shape[:2]
+def yolo_postprocess(frame, raw, conf_thres=0.003, nms_thres=0.45):
+    BLOB_SIZE  = 640
+    h, w       = frame.shape[:2]
     detections = []
 
     outs = [raw] if isinstance(raw, np.ndarray) else list(raw)
     for out in outs:
         arr = np.array(out, dtype=np.float32)
-
         while arr.ndim > 2 and arr.shape[0] == 1:
             arr = arr[0]
-
         if arr.ndim == 2 and arr.shape[0] < arr.shape[1]:
             arr = arr.T
-
         if arr.ndim != 2:
             continue
 
         num_cols = arr.shape[1]
         dprint(f"postprocess arr shape = {arr.shape}")
 
+        if num_cols >= 5:
+            raw_confs = arr[:, 4]
+            dprint(
+                f"conf stats: min={raw_confs.min():.4f} max={raw_confs.max():.4f} "
+                f"mean={raw_confs.mean():.4f} "
+                f">0.10={(raw_confs > 0.10).sum()} "
+                f">0.01={(raw_confs > 0.01).sum()} "
+                f">0.003={(raw_confs > 0.003).sum()}"
+            )
+
         for row in arr:
             cx, cy, bw, bh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
 
             if num_cols == 5:
-                conf = float(row[4])
+                conf_raw = float(row[4])
+                # raw output ของ YOLOv8 ส่งค่า 0-1 ตรงๆ ไม่ต้องทำ sigmoid
+                conf   = conf_raw if 0.0 <= conf_raw <= 1.0 else 1.0 / (1.0 + np.exp(-conf_raw))
                 cls_id = 0
             elif num_cols == 6:
-                conf = float(row[4]) * float(row[5])
+                conf   = float(row[4]) * float(row[5])
                 cls_id = 0
             elif num_cols == 85:
-                obj_conf = float(row[4])
+                obj_conf  = float(row[4])
                 cls_scores = row[5:]
-                cls_id = int(np.argmax(cls_scores))
-                conf = obj_conf * float(cls_scores[cls_id])
+                cls_id    = int(np.argmax(cls_scores))
+                conf      = obj_conf * float(cls_scores[cls_id])
             else:
                 cls_scores = row[4:]
-                cls_id = int(np.argmax(cls_scores))
-                conf = float(cls_scores[cls_id])
+                cls_id     = int(np.argmax(cls_scores))
+                conf       = float(cls_scores[cls_id])
 
             if conf < conf_thres:
                 continue
 
-            scale_x = w / BLOB_SIZE
-            scale_y = h / BLOB_SIZE
-
-            cx_f = cx * scale_x
-            cy_f = cy * scale_y
-            bw_f = bw * scale_x
-            bh_f = bh * scale_y
+            scale_x = w / BLOB_SIZE; scale_y = h / BLOB_SIZE
+            cx_f = cx * scale_x; cy_f = cy * scale_y
+            bw_f = bw * scale_x; bh_f = bh * scale_y
 
             left   = max(0, int(cx_f - bw_f / 2))
             top    = max(0, int(cy_f - bh_f / 2))
@@ -513,25 +544,26 @@ def yolo_postprocess(frame, raw, conf_thres=0.25, nms_thres=0.45):
             detections.append([left, top, width, height, float(conf), cls_id])
 
     if not detections:
-        dprint(f"yolo_postprocess: no detection")
+        dprint("yolo_postprocess: no detection above threshold")
         return None, 0.0, None
 
     boxes = [d[:4] for d in detections]
     confs = [d[4] for d in detections]
-    idxs = cv2.dnn.NMSBoxes(boxes, confs, conf_thres, nms_thres)
+    idxs  = cv2.dnn.NMSBoxes(boxes, confs, conf_thres, nms_thres)
 
-    if len(idxs) == 0:
-        best = max(detections, key=lambda x: x[4])
-    else:
-        idxs = idxs.flatten().tolist()
-        best_i = max(idxs, key=lambda i: detections[i][4])
-        best = detections[best_i]
+    candidates = detections if len(idxs) == 0 else [detections[i] for i in idxs.flatten().tolist()]
 
-    dprint(f"yolo_postprocess: box={best[:4]} conf={best[4]:.3f} cls={best[5]}")
+    def score(d):
+        ar = d[2] / max(d[3], 1)
+        ar_bonus = 0.15 if 1.4 <= ar <= 4.0 else 0.0
+        return d[4] + ar_bonus
+
+    best = max(candidates, key=score)
+    dprint(f"yolo best: box={best[:4]} conf={best[4]:.4f} ar={best[2]/max(best[3],1):.2f}")
     return tuple(best[:4]), best[4], best[5]
 
 # ============================================================
-#  ตรวจจับ object ภายใน ROI
+#  detect_inside_roi — ถ้า YOLO ไม่เจอ ลอง OCR ทั้ง ROI (fallback)
 # ============================================================
 def detect_inside_roi(frame_disp, rx, model_path, min_conf, cam_label=""):
     if frame_disp is None:
@@ -541,86 +573,65 @@ def detect_inside_roi(frame_disp, rx, model_path, min_conf, cam_label=""):
     if crop_img is None or crop_img.size == 0:
         return None, 0.0, None
 
-    net = get_net(model_path)
-    blob = cv2.dnn.blobFromImage(crop_img, 1 / 255.0, (640, 640), swapRB=True, crop=False)
+    net  = get_net(model_path)
+    blob = cv2.dnn.blobFromImage(crop_img, 1/255.0, (640, 640), swapRB=True, crop=False)
     net.setInput(blob)
     raw = net.forward()
 
-    raw_arr = np.array(raw)
-    dprint(f"[{cam_label}] YOLO output shape = {raw_arr.shape}")
+    dprint(f"[{cam_label}] YOLO output shape = {np.array(raw).shape}")
 
     box, conf, cls_id = yolo_postprocess(crop_img, raw, conf_thres=min_conf, nms_thres=0.45)
+    dprint(f"[{cam_label}] detect result: box={box} conf={conf:.4f}")
 
     if box is None or conf < min_conf:
         return None, conf, None
 
     x, y, bw, bh = box
-    x1, y1 = x, y
-    x2, y2 = x + bw, y + bh
-
-    x1 = max(0, x1)
-    y1 = max(0, y1)
-    x2 = min(crop_img.shape[1], x2)
-    y2 = min(crop_img.shape[0], y2)
+    x1 = max(0, x); y1 = max(0, y)
+    x2 = min(crop_img.shape[1], x + bw)
+    y2 = min(crop_img.shape[0], y + bh)
 
     if x2 <= x1 or y2 <= y1:
         return None, conf, None
 
     sub = crop_img[y1:y2, x1:x2].copy()
 
-    # วาดกรอบ bbox ลงภาพแสดงผล
-    H, W = frame_disp.shape[:2]
-    rx_x1 = int(rx[0] * W)
-    rx_y1 = int(rx[1] * H)
-
-    cv2.rectangle(
-        frame_disp,
-        (rx_x1 + x1, rx_y1 + y1),
-        (rx_x1 + x2, rx_y1 + y2),
-        (0, 0, 255),
-        3
-    )
-    cv2.putText(
-        frame_disp,
-        f"{conf:.2f}",
-        (rx_x1 + x1, rx_y1 + y1 - 5),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 0, 255),
-        2
-    )
+    # วาดกรอบบนภาพแสดงผล
+    H, W    = frame_disp.shape[:2]
+    rx_x1   = int(rx[0] * W); rx_y1 = int(rx[1] * H)
+    cv2.rectangle(frame_disp,
+                  (rx_x1 + x1, rx_y1 + y1),
+                  (rx_x1 + x2, rx_y1 + y2),
+                  (0, 0, 255), 3)
+    cv2.putText(frame_disp, f"{conf:.3f}",
+                (rx_x1 + x1, rx_y1 + y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
     return sub, conf, (x1, y1, x2, y2)
 
 # ============================================================
-#  vote ค่า OCR มิเตอร์ให้คงที่
+#  stable_vote สำหรับมิเตอร์
 # ============================================================
 def stable_vote(history, min_count=FUEL_MIN_VOTES):
     if not history:
         return ""
-
     numeric = []
     for v in history:
         try:
             numeric.append((float(v), v))
         except Exception:
             pass
-
     if not numeric:
         return ""
-
     vals = [n[0] for n in numeric]
-    med = float(np.median(vals))
-    tol = max(med * 0.20, 1.0)
-
+    med  = float(np.median(vals))
+    tol  = max(med * 0.20, 1.0)
     filtered = [v_str for v_f, v_str in numeric if abs(v_f - med) <= tol]
     if not filtered:
         filtered = [n[1] for n in numeric]
-
     counts = {}
     for v in filtered:
         counts[v] = counts.get(v, 0) + 1
-
     best = max(counts, key=counts.get)
     return best if counts[best] >= min_count else ""
 
@@ -629,46 +640,40 @@ def stable_vote(history, min_count=FUEL_MIN_VOTES):
 # ============================================================
 def init_google():
     creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
-    sh = gspread.authorize(creds).open_by_key(SHEET_KEY).sheet1
-
+    sh    = gspread.authorize(creds).open_by_key(SHEET_KEY).sheet1
     drive_service = None
     if DRIVE_AVAILABLE and DRIVE_FOLDER_ID:
         try:
             from google.oauth2 import service_account
-            sa_creds = service_account.Credentials.from_service_account_file(
-                CREDS_FILE, scopes=SCOPE
-            )
+            sa_creds = service_account.Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPE)
             drive_service = build("drive", "v3", credentials=sa_creds)
         except Exception as e:
             print(f"[WARN] Drive init failed: {e}")
-
     return sh, drive_service
 
 def upload_to_drive(drive_service, img_array, filename, folder_id, retries=3):
     if drive_service is None or img_array is None or not folder_id:
         return ""
-
     for attempt in range(retries):
         try:
             ok, buf = cv2.imencode(".jpg", img_array, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if not ok:
                 return ""
-            fh = io.BytesIO(buf.tobytes())
+            fh    = io.BytesIO(buf.tobytes())
             media = MediaIoBaseUpload(fh, mimetype="image/jpeg", resumable=False)
-            r = drive_service.files().create(
-                body={"name": filename, "parents": [folder_id]},
-                media_body=media,
-                fields="webViewLink"
-            ).execute()
+            r     = drive_service.files().create(
+                        body={"name": filename, "parents": [folder_id]},
+                        media_body=media,
+                        fields="webViewLink"
+                    ).execute()
             return r.get("webViewLink", "")
         except Exception as e:
             print(f"[WARN] Drive upload attempt {attempt+1}: {e}")
             time.sleep(1.5 ** attempt)
-
     return ""
 
 # ============================================================
-#  ตัว worker ส่งข้อมูลขึ้น cloud
+#  cloud_worker
 # ============================================================
 def cloud_worker(sh, drive_service):
     while True:
@@ -676,7 +681,6 @@ def cloud_worker(sh, drive_service):
         if task is None:
             cloud_queue.task_done()
             break
-
         try:
             action  = task["action"]
             station = task["station"]
@@ -686,45 +690,26 @@ def cloud_worker(sh, drive_service):
             if action == "save_plate":
                 txt = task.get("plate_text", "")
                 img = task.get("plate_img")
-
                 if img is not None:
                     cv2.imwrite(f"LOCAL_PLATE_{station}_{ts_safe}.jpg", img)
-
-                upload_to_drive(
-                    drive_service,
-                    img,
-                    f"PLATE_{station}_{ts_safe}.jpg",
-                    DRIVE_FOLDER_ID
-                )
-
+                upload_to_drive(drive_service, img, f"PLATE_{station}_{ts_safe}.jpg", DRIVE_FOLDER_ID)
                 row_data = [ts, txt, "", "", "", ""]
                 sh.append_row(row_data, value_input_option="USER_ENTERED")
                 idx = len(sh.get_all_values())
-
                 with station_state[station]["lock"]:
                     station_state[station]["sheet_row_idx"] = idx
-
-                print(f"[SHEET] บันทึกทะเบียน {txt} แถว {idx}")
+                print(f"[SHEET] ✅ บันทึกทะเบียน '{txt}' แถว {idx}")
 
             elif action == "save_fuel":
                 txt = task.get("fuel_text", "0")
                 idx = task.get("row_idx")
                 img = task.get("fuel_img")
-
                 if img is not None:
                     cv2.imwrite(f"LOCAL_FUEL_{station}_{ts_safe}.jpg", img)
-
-                upload_to_drive(
-                    drive_service,
-                    img,
-                    f"FUEL_{station}_{ts_safe}.jpg",
-                    DRIVE_FOLDER_ID
-                )
-
+                upload_to_drive(drive_service, img, f"FUEL_{station}_{ts_safe}.jpg", DRIVE_FOLDER_ID)
                 if idx:
                     sh.update(f"C{idx}", [[txt]], value_input_option="USER_ENTERED")
-
-                print(f"[SHEET] บันทึกน้ำมัน {txt} แถว {idx}")
+                print(f"[SHEET] ✅ บันทึกน้ำมัน '{txt}' แถว {idx}")
 
         except Exception as e:
             print(f"[ERROR] cloud_worker: {e}")
@@ -733,48 +718,39 @@ def cloud_worker(sh, drive_service):
             time.sleep(0.3)
 
 # ============================================================
-#  Reset state กลับไปเริ่มที่ทะเบียน
+#  Reset helpers
 # ============================================================
 def reset_station_to_plate(sid):
     ss = station_state[sid]
-    ss["state"] = STATE_WAIT_PLATE
-    ss["plate_text"] = ""
-    ss["plate_img"] = None
-    ss["fuel_last_text"] = ""
-    ss["fuel_img"] = None
-    ss["fuel_since"] = 0.0
+    ss["state"]            = STATE_WAIT_PLATE
+    ss["plate_text"]       = ""
+    ss["plate_img"]        = None
+    ss["fuel_last_text"]   = ""
+    ss["fuel_img"]         = None
+    ss["fuel_since"]       = 0.0
     ss["fuel_raw_history"] = []
-    ss["sheet_row_idx"] = None
-    ss["last_save"] = time.time()
-    ss["confirm_hits"] = 0
-    ss["confirm_value"] = ""
-    ss["confirm_first_ts"] = 0.0
+    ss["sheet_row_idx"]    = None
+    ss["last_save"]        = time.time()
     gc.collect()
 
-# ============================================================
-#  Reset state ไปโหมดรอมิเตอร์
-# ============================================================
 def reset_station_to_fuel(sid, plate_text, plate_img):
     ss = station_state[sid]
-    ss["state"] = STATE_WAIT_FUEL
-    ss["plate_text"] = plate_text
-    ss["plate_img"] = plate_img.copy() if plate_img is not None else None
-    ss["fuel_last_text"] = ""
-    ss["fuel_img"] = None
-    ss["fuel_since"] = time.time()
+    ss["state"]            = STATE_WAIT_FUEL
+    ss["plate_text"]       = plate_text
+    ss["plate_img"]        = plate_img.copy() if plate_img is not None else None
+    ss["fuel_last_text"]   = ""
+    ss["fuel_img"]         = None
+    ss["fuel_since"]       = time.time()
     ss["fuel_raw_history"] = []
-    ss["sheet_row_idx"] = None
-    ss["confirm_hits"] = 0
-    ss["confirm_value"] = ""
-    ss["confirm_first_ts"] = 0.0
+    ss["sheet_row_idx"]    = None
 
 # ============================================================
-#  Thread ตรวจทะเบียน CAM1
+#  Thread CAM1 — ตรวจทะเบียน
 # ============================================================
 def cam_thread_plate():
     cam_key = "CAM1"
-    sid = CAM_CONFIG[cam_key]["station"]
-    cap = RealtimeCapture(rtsp_url(cam_key)).start()
+    sid     = CAM_CONFIG[cam_key]["station"]
+    cap     = RealtimeCapture(rtsp_url(cam_key)).start()
     print(f"[{cam_key}] thread started")
 
     while True:
@@ -789,84 +765,117 @@ def cam_thread_plate():
                 continue
 
             disp = frame.copy()
-            rx = roi_cfg[cam_key]
+            rx   = roi_cfg[cam_key]
             H, W = frame.shape[:2]
 
-            # วาดกรอบ ROI
-            cv2.rectangle(
-                disp,
-                (int(rx[0] * W), int(rx[1] * H)),
-                (int(rx[2] * W), int(rx[3] * H)),
-                (0, 255, 0),
-                2
-            )
+            # วาดกรอบ ROI สีเขียว
+            cv2.rectangle(disp,
+                          (int(rx[0]*W), int(rx[1]*H)),
+                          (int(rx[2]*W), int(rx[3]*H)),
+                          (0, 255, 0), 2)
 
-            # ถ้าไม่ใช่โหมดทะเบียน ให้หยุดทำงานของ CAM1
+            # ── [หยุด CAM1] ตาม Flowchart ─────────────────────────
             if cur_state != STATE_WAIT_PLATE:
-                disp = put_text(disp, "CAM1 STOPPED - WAITING FUEL", (8, 10), (0, 255, 255), 20)
+                disp = put_text(disp, "CAM1 STOPPED - WAITING FUEL",
+                                (8, 10), (0, 255, 255), 20)
                 with frame_locks[cam_key]:
                     latest_frames[cam_key] = disp.copy()
                 time.sleep(0.05)
                 continue
 
-            # ตรวจจับทะเบียนภายใน ROI
-            best_crop, conf, box = detect_inside_roi(disp, rx, PLATE_MODEL, PLATE_MIN_CONF, cam_key)
+            # ── YOLO ────────────────────────────────────────────────
+            best_crop, conf, box = detect_inside_roi(
+                disp, rx, PLATE_MODEL, PLATE_MIN_CONF, cam_key)
 
             with crop_locks[cam_key]:
                 crop_monitors[cam_key] = best_crop.copy() if best_crop is not None else None
 
-            # OCR ทะเบียน
-            txt = ocr_plate(best_crop) if best_crop is not None else ""
+            # ── บันทึก debug images ─────────────────────────────────
+            if best_crop is not None:
+                try:
+                    cv2.imwrite("debug_plate_crop.jpg", best_crop)
+                    dbg = best_crop
+                    hsv_d = cv2.cvtColor(best_crop, cv2.COLOR_BGR2HSV)
+                    mask_d = cv2.inRange(hsv_d, np.array([10, 40, 60]), np.array([45, 255, 255]))
+                    ys_d, xs_d = np.where(mask_d > 0)
+                    if len(xs_d) > 50:
+                        x1d = max(0, xs_d.min() - 3); x2d = min(best_crop.shape[1], xs_d.max() + 3)
+                        y1d = max(0, ys_d.min() - 5); y2d = min(best_crop.shape[0], ys_d.max() + 5)
+                        if (x2d - x1d) > 20 and (y2d - y1d) > 10:
+                            dbg = best_crop[y1d:y2d, x1d:x2d]
+                    cv2.imwrite("debug_plate_yellow.jpg", dbg)
+                    h_t = dbg.shape[0]
+                    top_dbg = dbg[int(h_t*0.32):int(h_t*0.78), :] or dbg
+                    cv2.imwrite("debug_plate_top.jpg", top_dbg)
+                    th_d = preprocess_ocr_plate(top_dbg)
+                    if th_d is not None:
+                        cv2.imwrite("debug_plate_thresh.jpg", th_d)
+                except Exception:
+                    pass
 
-            if len(txt) >= PLATE_MIN_CHARS:
-                with ss["lock"]:
-                    now = time.time()
+            # ── Decision: พบป้ายหรือไม่ ────────────────────────────
+            if best_crop is None:
+                # YOLO ไม่เจอ → "ไม่พบป้ายทะเบียน"
+                label = "[CAM1] ไม่พบป้ายทะเบียน"
+                disp  = put_text(disp, label, (8, 10), (80, 80, 255), 20)
+                with frame_locks[cam_key]:
+                    latest_frames[cam_key] = disp.copy()
+                continue
 
-                    if txt == ss["confirm_value"]:
-                        if now - ss["confirm_first_ts"] <= PLATE_CONFIRM_SEC:
-                            ss["confirm_hits"] += 1
-                        else:
-                            ss["confirm_hits"] = 1
-                            ss["confirm_first_ts"] = now
-                    else:
-                        ss["confirm_value"] = txt
-                        ss["confirm_hits"] = 1
-                        ss["confirm_first_ts"] = now
+            # ── OCR ────────────────────────────────────────────────
+            txt = ocr_plate(best_crop)
+            dprint(f"[CAM1] OCR='{txt}' len={len(txt)} conf={conf:.4f}")
 
-                    if (
-                        ss["confirm_hits"] >= PLATE_CONFIRM_FRAMES
-                        and time.time() - ss["last_save"] >= SAVE_COOLDOWN
-                    ):
-                        plate_img = best_crop.copy() if best_crop is not None else None
-                        ts = now_ts()
-                        ss["last_save"] = time.time()
+            # ── Decision: OCR ถูกต้องหรือไม่ ───────────────────────
+            if len(txt) < PLATE_MIN_CHARS:
+                # อ่านไม่ถูกต้อง → แสดงผล loop ต่อ
+                label = (f"[CAM1] OCR: '{txt}' ({len(txt)} ตัว — ต้องการ ≥{PLATE_MIN_CHARS})"
+                         if txt else f"[CAM1] OCR ไม่ได้ผล  [{conf:.3f}]")
+                disp  = put_text(disp, label, (8, 10), (0, 120, 255), 20)
+                with frame_locks[cam_key]:
+                    latest_frames[cam_key] = disp.copy()
+                continue
 
-                        # เปลี่ยนสถานะไปโหมดมิเตอร์
-                        reset_station_to_fuel(sid, txt, plate_img)
+            # ── OCR ผ่าน ≥ PLATE_MIN_CHARS ──────────────────────────
+            # เช็ค cooldown ป้องกันบันทึกซ้ำ
+            with ss["lock"]:
+                since_last = time.time() - ss["last_save"]
 
-                        # ส่งงานบันทึกทะเบียนไป cloud
-                        try:
-                            cloud_queue.put_nowait({
-                                "action": "save_plate",
-                                "station": sid,
-                                "ts": ts,
-                                "plate_text": txt,
-                                "plate_img": plate_img,
-                            })
-                        except queue.Full:
-                            pass
+            if since_last < SAVE_COOLDOWN:
+                remain = SAVE_COOLDOWN - since_last
+                disp   = put_text(disp,
+                                  f"[CAM1] {txt}  cooldown {remain:.0f}s",
+                                  (8, 10), (0, 200, 255), 20)
+                with frame_locks[cam_key]:
+                    latest_frames[cam_key] = disp.copy()
+                continue
 
-                        disp = put_text(disp, f"[CAM1] SAVED {txt} {ts}", (8, 10), (0, 220, 120), 20)
-                        with frame_locks[cam_key]:
-                            latest_frames[cam_key] = disp.copy()
-                        continue
+            # ── [หยุด CAM1] → บันทึก Sheet → Drive → ไป WAIT_FUEL ──
+            plate_img = best_crop.copy()
+            ts        = now_ts()
 
-            label = txt if txt else "รอจับทะเบียน"
-            if conf > 0:
-                label += f"  [{conf:.2f}]"
+            with ss["lock"]:
+                ss["last_save"] = time.time()
 
-            disp = put_text(disp, f"[CAM1] {label}", (8, 10), (0, 220, 120), 20)
+            # เปลี่ยน state ก่อน (CAM1 หยุด, CAM2 เริ่ม)
+            reset_station_to_fuel(sid, txt, plate_img)
 
+            # ส่งงาน cloud (บันทึก Sheet + Drive)
+            try:
+                cloud_queue.put_nowait({
+                    "action":     "save_plate",
+                    "station":    sid,
+                    "ts":         ts,
+                    "plate_text": txt,
+                    "plate_img":  plate_img,
+                })
+            except queue.Full:
+                print("[WARN] cloud_queue เต็ม ข้ามการบันทึกทะเบียน")
+
+            print(f"[CAM1] ✅ บันทึกทะเบียน '{txt}'  {ts}")
+            disp = put_text(disp,
+                            f"[CAM1] ✅ SAVED: {txt}  {ts}",
+                            (8, 10), (0, 255, 100), 22)
             with frame_locks[cam_key]:
                 latest_frames[cam_key] = disp.copy()
 
@@ -875,12 +884,12 @@ def cam_thread_plate():
             time.sleep(0.2)
 
 # ============================================================
-#  Thread ตรวจมิเตอร์ CAM2
+#  Thread CAM2 — ตรวจมิเตอร์
 # ============================================================
 def cam_thread_fuel():
     cam_key = "CAM2"
-    sid = CAM_CONFIG[cam_key]["station"]
-    cap = RealtimeCapture(rtsp_url(cam_key)).start()
+    sid     = CAM_CONFIG[cam_key]["station"]
+    cap     = RealtimeCapture(rtsp_url(cam_key)).start()
     print(f"[{cam_key}] thread started")
 
     while True:
@@ -895,19 +904,15 @@ def cam_thread_fuel():
                 continue
 
             disp = frame.copy()
-            rx = roi_cfg[cam_key]
+            rx   = roi_cfg[cam_key]
             H, W = frame.shape[:2]
 
-            # วาดกรอบ ROI
-            cv2.rectangle(
-                disp,
-                (int(rx[0] * W), int(rx[1] * H)),
-                (int(rx[2] * W), int(rx[3] * H)),
-                (0, 255, 0),
-                2
-            )
+            cv2.rectangle(disp,
+                          (int(rx[0]*W), int(rx[1]*H)),
+                          (int(rx[2]*W), int(rx[3]*H)),
+                          (0, 255, 0), 2)
 
-            # ถ้ายังไม่ถึงโหมดมิเตอร์ ให้หยุดไว้ก่อน
+            # ── รอให้ CAM1 บันทึกทะเบียนก่อน ───────────────────────
             if cur_state != STATE_WAIT_FUEL:
                 disp = put_text(disp, "WAITING PLATE", (8, 10), (255, 200, 0), 20)
                 with frame_locks[cam_key]:
@@ -915,14 +920,32 @@ def cam_thread_fuel():
                 time.sleep(0.05)
                 continue
 
-            # ตรวจจับมิเตอร์ภายใน ROI
-            best_crop, conf, box = detect_inside_roi(disp, rx, FUEL_MODEL, FUEL_MIN_CONF, cam_key)
+            # ── YOLO ─────────────────────────────────────────────────
+            best_crop, conf, box = detect_inside_roi(
+                disp, rx, FUEL_MODEL, FUEL_MIN_CONF, cam_key)
 
             with crop_locks[cam_key]:
                 crop_monitors[cam_key] = best_crop.copy() if best_crop is not None else None
 
-            # OCR มิเตอร์
-            txt = ocr_fuel(best_crop) if best_crop is not None else ""
+            if best_crop is not None:
+                try:
+                    cv2.imwrite("debug_fuel_crop.jpg", best_crop)
+                    th_d = preprocess_ocr_fuel(best_crop)
+                    if th_d is not None:
+                        cv2.imwrite("debug_fuel_thresh.jpg", th_d)
+                except Exception:
+                    pass
+
+            # ── Decision: พบมิเตอร์หรือไม่ ──────────────────────────
+            if best_crop is None:
+                disp = put_text(disp, "[TANK] ไม่พบมิเตอร์", (8, 10), (80, 80, 255), 20)
+                with frame_locks[cam_key]:
+                    latest_frames[cam_key] = disp.copy()
+                continue
+
+            # ── OCR ──────────────────────────────────────────────────
+            txt = ocr_fuel(best_crop)
+            dprint(f"[CAM2] conf={conf:.4f} ocr='{txt}'")
 
             with ss["lock"]:
                 if txt:
@@ -933,38 +956,53 @@ def cam_thread_fuel():
                     stable = stable_vote(ss["fuel_raw_history"])
                     if stable and stable != ss["fuel_last_text"]:
                         ss["fuel_last_text"] = stable
-                        ss["fuel_since"] = time.time()
-                        ss["fuel_img"] = best_crop.copy() if best_crop is not None else ss["fuel_img"]
+                        ss["fuel_since"]     = time.time()
+                        ss["fuel_img"]       = best_crop.copy() if best_crop is not None else ss["fuel_img"]
 
-                elapsed = (time.time() - ss["fuel_since"] if ss["fuel_since"] > 0 else 0)
+                elapsed = time.time() - ss["fuel_since"] if ss["fuel_since"] > 0 else 0
 
-                # ถ้าค่าคงที่พอแล้ว ให้บันทึก
+                # ── Decision: ตัวเลขคงที่ + OCR ถูกต้อง ─────────────
                 if elapsed >= FUEL_STABLE_SEC and ss["state"] == STATE_WAIT_FUEL:
-                    final_fuel = ss["fuel_last_text"] if ss["fuel_last_text"] else "0"
-                    final_img = (
-                        ss["fuel_img"].copy()
-                        if ss["fuel_img"] is not None
-                        else (best_crop.copy() if best_crop is not None else None)
-                    )
+                    final_fuel = ss["fuel_last_text"]
+
+                    # Decision: OCR ถูกต้องหรือไม่ (≥ FUEL_MIN_CHARS ตัวเลข)
+                    digits_only = re.sub(r"[^0-9]", "", final_fuel)
+                    if len(digits_only) < FUEL_MIN_CHARS:
+                        # ไม่ถูกต้อง → "ไม่พบปริมาณน้ำมัน"
+                        disp = put_text(disp,
+                                        f"[TANK] ไม่พบปริมาณน้ำมัน (OCR='{final_fuel}')",
+                                        (8, 10), (0, 80, 255), 20)
+                        # reset history เพื่อรอค่าใหม่
+                        ss["fuel_raw_history"] = []
+                        ss["fuel_last_text"]   = ""
+                        ss["fuel_since"]       = 0.0
+                        with frame_locks[cam_key]:
+                            latest_frames[cam_key] = disp.copy()
+                        continue
+
+                    # OCR ผ่าน → [หยุด CAM2] → บันทึก
+                    final_img  = (ss["fuel_img"].copy() if ss["fuel_img"] is not None
+                                  else best_crop.copy())
                     target_row = ss["sheet_row_idx"]
-                    ts = now_ts()
+                    ts         = now_ts()
 
                     try:
                         cloud_queue.put_nowait({
-                            "action": "save_fuel",
-                            "station": sid,
-                            "ts": ts,
+                            "action":    "save_fuel",
+                            "station":   sid,
+                            "ts":        ts,
                             "fuel_text": final_fuel,
-                            "fuel_img": final_img,
-                            "row_idx": target_row,
+                            "fuel_img":  final_img,
+                            "row_idx":   target_row,
                         })
                     except queue.Full:
-                        pass
+                        print("[WARN] cloud_queue เต็ม ข้ามการบันทึกน้ำมัน")
 
-                    # กลับไปเริ่มรอบใหม่ที่ทะเบียน
                     reset_station_to_plate(sid)
-
-                    disp = put_text(disp, f"[TANK] SAVED {final_fuel} {ts}", (8, 10), (0, 255, 200), 20)
+                    print(f"[CAM2] ✅ บันทึกน้ำมัน '{final_fuel}'  {ts}")
+                    disp = put_text(disp,
+                                    f"[TANK] ✅ SAVED: {final_fuel}  {ts}",
+                                    (8, 10), (0, 255, 200), 20)
                     with frame_locks[cam_key]:
                         latest_frames[cam_key] = disp.copy()
                     continue
@@ -972,13 +1010,9 @@ def cam_thread_fuel():
                 current_fuel = ss["fuel_last_text"] or "รอมิเตอร์นิ่ง"
 
             color = (0, 255, 200) if elapsed >= FUEL_STABLE_SEC else (255, 200, 0)
-            disp = put_text(
-                disp,
-                f"[TANK] {current_fuel} ({elapsed:.1f}/{FUEL_STABLE_SEC:.0f}s)",
-                (8, 10),
-                color,
-                20
-            )
+            disp  = put_text(disp,
+                             f"[TANK] {current_fuel}  ({elapsed:.1f}/{FUEL_STABLE_SEC:.0f}s)",
+                             (8, 10), color, 20)
 
             with frame_locks[cam_key]:
                 latest_frames[cam_key] = disp.copy()
@@ -988,20 +1022,17 @@ def cam_thread_fuel():
             time.sleep(0.2)
 
 # ============================================================
-#  ภาพว่างสำหรับช่องที่ไม่มีภาพ
+#  ภาพว่าง
 # ============================================================
 def blank_cell(cam):
     c = np.zeros((CELL_H, CELL_W, 3), dtype=np.uint8)
     return put_text(c, f"[{cam}] ไม่มีสัญญาณภาพ", (20, CELL_H // 2), (100, 100, 100), 20)
 
-# ============================================================
-#  Crop monitor ว่าง
-# ============================================================
 def blank_sub():
     return np.zeros((180, 320, 3), dtype=np.uint8) + 40
 
 # ============================================================
-#  ตั้ง ROI แบบ manual
+#  ตั้ง ROI
 # ============================================================
 def setup_roi_interactively():
     for cam in ["CAM1", "CAM2"]:
@@ -1009,14 +1040,13 @@ def setup_roi_interactively():
         cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         ret, fr = cap.read()
         cap.release()
-
         if not ret or fr is None:
             print(f"[WARN] ROI setup: ไม่สามารถอ่านภาพจาก {cam}")
             continue
 
         H, W = fr.shape[:2]
-        win = f"ROI Setup Mode: {cam} (Enter=Save, S=Skip)"
-        ds = {"s": None, "e": None, "drag": False, "done": False}
+        win  = f"ROI Setup: {cam}  (Enter=Save, S=Skip)"
+        ds   = {"s": None, "e": None, "drag": False, "done": False}
 
         def mcb(ev, x, y, fl, p):
             if ev == cv2.EVENT_LBUTTONDOWN:
@@ -1031,68 +1061,45 @@ def setup_roi_interactively():
         cv2.setMouseCallback(win, mcb)
 
         while True:
-            d = fr.copy()
+            d  = fr.copy()
             rx = roi_cfg[cam]
-            cv2.rectangle(
-                d,
-                (int(rx[0] * W), int(rx[1] * H)),
-                (int(rx[2] * W), int(rx[3] * H)),
-                (0, 255, 0),
-                2
-            )
-
+            cv2.rectangle(d,
+                          (int(rx[0]*W), int(rx[1]*H)),
+                          (int(rx[2]*W), int(rx[3]*H)),
+                          (0, 255, 0), 2)
             if ds["s"] and ds["e"]:
                 cv2.rectangle(d, ds["s"], ds["e"], (0, 0, 255), 3)
-
             cv2.imshow(win, d)
             k = cv2.waitKey(30) & 0xFF
-
             if k == 13 and ds["done"]:
-                x1 = min(ds["s"][0], ds["e"][0])
-                y1 = min(ds["s"][1], ds["e"][1])
-                x2 = max(ds["s"][0], ds["e"][0])
-                y2 = max(ds["s"][1], ds["e"][1])
+                x1 = min(ds["s"][0], ds["e"][0]); y1 = min(ds["s"][1], ds["e"][1])
+                x2 = max(ds["s"][0], ds["e"][0]); y2 = max(ds["s"][1], ds["e"][1])
                 if (x2 - x1) > 10 and (y2 - y1) > 10:
-                    roi_cfg[cam] = [x1 / W, y1 / H, x2 / W, y2 / H]
+                    roi_cfg[cam] = [x1/W, y1/H, x2/W, y2/H]
                     print(f"[ROI] {cam} = {roi_cfg[cam]}")
                 break
             elif k in (ord('s'), ord('S'), 27):
                 break
-
         cv2.destroyWindow(win)
-
     save_roi()
 
 # ============================================================
-#  main program
+#  main
 # ============================================================
 def main():
-    # ทำงานในโฟลเดอร์ของไฟล์นี้
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
-    # โหลด ROI เดิมก่อน
     load_roi(reset=False)
-
-    # ถ้าไม่มีไฟล์ ROI ค่อยเปิดให้ตีกรอบครั้งแรก
     if not os.path.exists(ROI_FILE):
         setup_roi_interactively()
 
-    # เชื่อม Google Sheet / Drive
     sh, drive_service = init_google()
-
-    # เปิด worker อัปโหลดขึ้น cloud
     threading.Thread(target=cloud_worker, args=(sh, drive_service), daemon=True).start()
-
-    # เปิด thread กล้อง 2 ตัว
     threading.Thread(target=cam_thread_plate, daemon=True).start()
-    threading.Thread(target=cam_thread_fuel, daemon=True).start()
+    threading.Thread(target=cam_thread_fuel,  daemon=True).start()
 
     gc_timer = time.time()
 
     while True:
-        # ====================================================
-        #  รวมภาพกล้องทั้งสองขึ้น dashboard
-        # ====================================================
         row = []
         for k in ["CAM1", "CAM2"]:
             with frame_locks[k]:
@@ -1101,29 +1108,19 @@ def main():
 
         grid = np.hstack(row)
 
-        # ====================================================
-        #  แสดง status ปัจจุบัน
-        # ====================================================
         with station_state["S1"]["lock"]:
             pt1 = station_state["S1"]["plate_text"] or "-"
             st1 = station_state["S1"]["state"]
-
         with station_state["S2"]["lock"]:
             fu2 = station_state["S2"]["fuel_last_text"] or "-"
             st2 = station_state["S2"]["state"]
 
-        status_text = (
-            f"S1[{st1}] ทะเบียน={pt1}   "
-            f"S2[{st2}] มิเตอร์={fu2}   "
-            f"[Q=ปิดระบบ]"
-        )
-        grid = put_text(grid, status_text, (8, grid.shape[0] - 28), (0, 0, 255), 18)
-
+        status = (f"S1[{st1}] ทะเบียน={pt1}   "
+                  f"S2[{st2}] มิเตอร์={fu2}   "
+                  f"[Q=ปิดระบบ]")
+        grid = put_text(grid, status, (8, grid.shape[0] - 28), (0, 0, 255), 18)
         cv2.imshow("Smart Refueling Dashboard", grid)
 
-        # ====================================================
-        #  แสดง crop monitor สำหรับ debug
-        # ====================================================
         if DEBUG_UI:
             subs = []
             for k in ["CAM1", "CAM2"]:
@@ -1133,28 +1130,20 @@ def main():
                     subs.append(cv2.resize(ci, (320, 180)))
                 else:
                     b = blank_sub()
-                    cv2.putText(b, f"{k} WAITING", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+                    cv2.putText(b, f"{k} WAITING", (10, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
                     subs.append(b)
             cv2.imshow("Crop Monitor", np.hstack(subs))
 
-        # ====================================================
-        #  เก็บขยะหน่วยความจำเป็นระยะ
-        # ====================================================
         if time.time() - gc_timer > 30:
             gc.collect()
             gc_timer = time.time()
 
-        # ====================================================
-        #  กด q เพื่อออก
-        # ====================================================
         if cv2.waitKey(30) & 0xFF == ord('q'):
             break
 
     cv2.destroyAllWindows()
     cloud_queue.put(None)
 
-# ============================================================
-#  เริ่มโปรแกรม
-# ============================================================
 if __name__ == "__main__":
     main()
